@@ -1,0 +1,996 @@
+#!/usr/bin/env bash
+# greezmode -- tmux "grids" for parallel agent work: 2 windows ("pages") x 4 panes.
+#
+#   greezmode                 # live TUI over every grid: resume, close, build new
+#   greezmode --new [dir]     # skip the TUI, build a new grid (default: current dir)
+#   greezmode -n scratch      # build a new grid named "scratch"
+#   greezmode ~/code/api      # build a new grid there, session named after the dir
+#   greezmode --list          # plain text listing (with cpu/mem), no TUI
+#   greezmode --top           # full-screen monitor only, no grid management
+#   r-greezmode               # resume the grid you were last in, no TUI
+#   r-greezmode ~/code/api    # resume that project's grid
+#
+# Page 1 (window "agents"):  claude | opencode | opencode | plain shell
+# Page 2 (window "scratch"): four plain shells, nothing typed.
+#
+# The TUI is a live system monitor: every grid, window and pane shows the CPU
+# and memory of its whole process tree, refreshed every couple of seconds, with
+# a sparkline of where each one has been.
+#
+# TUI keys:  up/down or j/k move   enter resume   x close   n new grid
+#            p panes on/off   m monitor on/off   s sort by cpu   +/- refresh
+#            a show non-greez tmux sessions too   r refresh now   q quit
+#
+# A grid row resumes/closes the whole grid; an indented window row resumes
+# straight to that window, or closes just that window.
+#
+# greezmode never reuses a name: if it is taken the grid becomes name-2, name-3.
+# r-greezmode always reattaches to a live grid, and only builds (with agents
+# resuming their last conversation) when there is nothing left to attach to.
+#
+# Env overrides: GREEZ_SESSION, GREEZ_CLAUDE, GREEZ_OPENCODE,
+#                GREEZ_REFRESH (seconds), GREEZ_MON, GREEZ_PANES (0/1).
+set -euo pipefail
+
+CLAUDE_CMD="${GREEZ_CLAUDE:-claude}"
+OPENCODE_CMD="${GREEZ_OPENCODE:-opencode}"
+
+SESSION="${GREEZ_SESSION:-}"
+[[ -n "$SESSION" ]] && SESSION_EXPLICIT=1 || SESSION_EXPLICIT=0
+DIR=""
+DIR_GIVEN=0
+NEW_ONLY=0
+LIST_ONLY=0
+TOP_ONLY=0
+SHOW_ALL=0
+MISSING=()
+
+MON="${GREEZ_MON:-1}"          # monitor columns on
+PANES="${GREEZ_PANES:-1}"      # per-pane rows on
+REFRESH="${GREEZ_REFRESH:-2}"  # seconds between live samples
+SORT_CPU=0
+
+# Invoked as r-greezmode (or with --resume)? Go straight back to running work.
+RESUME=0
+[[ "$(basename "$0")" == r-* ]] && RESUME=1
+
+usage() {
+  sed -n '/^# greezmode --/,/^# Env overrides/p' "$0" | sed 's/^# \?//'
+  exit "${1:-0}"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--name)        SESSION="${2:?-n needs a session name}"; SESSION_EXPLICIT=1; shift 2 ;;
+    -r|--resume)      RESUME=1; shift ;;
+    -N|--new)         NEW_ONLY=1; shift ;;
+    -l|--list|--ls)   LIST_ONLY=1; shift ;;
+    -t|--top|--mon)   TOP_ONLY=1; shift ;;
+    -a|--all)         SHOW_ALL=1; shift ;;
+    --no-monitor)     MON=0; shift ;;
+    --no-panes)       PANES=0; shift ;;
+    -h|--help)        usage 0 ;;
+    -*)               echo "greezmode: unknown option $1" >&2; usage 1 ;;
+    *)                DIR="$1"; DIR_GIVEN=1; shift ;;
+  esac
+done
+
+command -v tmux >/dev/null || { echo "greezmode: tmux is not installed" >&2; exit 1; }
+
+# Pane titles are free text -- agents rewrite them with whatever they are doing,
+# punctuation included -- so every tmux listing is split on US (0x1f), never "|".
+SEP=$'\x1f'
+
+if (( DIR_GIVEN )); then
+  DIR="$(cd "$DIR" 2>/dev/null && pwd)" || {
+    echo "greezmode: no such directory: $DIR" >&2; exit 1; }
+fi
+
+# --- session naming -------------------------------------------------------
+# A grid is named after its project directory, so ~/code/api -> "api".
+name_for_dir() {
+  local b
+  b="$(basename "${1:-$PWD}")"
+  b="$(printf '%s' "$b" | tr -c 'A-Za-z0-9_-' '-' | sed 's/-\{2,\}/-/g; s/^-//; s/-$//')"
+  printf '%s' "${b:-greez}"
+}
+
+# Grids, newest-used first: last_attached|created|name|marker|dir|attached
+greez_sessions() {
+  local raw
+  raw="$(tmux list-sessions \
+    -F "#{session_last_attached}${SEP}#{session_created}${SEP}#{session_name}${SEP}#{@greezmode}${SEP}#{session_attached}${SEP}#{@greez_dir}" \
+    2>/dev/null || true)"
+  [[ -z "$raw" ]] && return 0
+  if (( SHOW_ALL )); then
+    printf '%s\n' "$raw" | sort -t"$SEP" -k1,1nr -k2,2nr
+  else
+    printf '%s\n' "$raw" | awk -F"$SEP" '$4 != ""' | sort -t"$SEP" -k1,1nr -k2,2nr
+  fi
+}
+
+# latest_session [base] -- newest grid, optionally only "base" or "base-N"
+latest_session() {
+  local base="${1:-}" la cr name mark rest
+  while IFS="$SEP" read -r la cr name mark rest; do
+    [[ -z "$name" ]] && continue
+    if [[ -n "$base" ]]; then
+      [[ "$name" == "$base" || "$name" =~ ^"$base"-[0-9]+$ ]] || continue
+    fi
+    printf '%s' "$name"; return 0
+  done < <(SHOW_ALL=0 greez_sessions)
+  return 1
+}
+
+free_name() {
+  local base="$1" cand="$1" n=2
+  while tmux has-session -t "=$cand" 2>/dev/null; do
+    cand="$base-$n"; n=$((n + 1))
+  done
+  printf '%s' "$cand"
+}
+
+attach() {
+  local s="$1" win="${2:-}"
+  [[ -n "$win" ]] && { tmux select-window -t "=$s:$win" 2>/dev/null || true; }
+  # Inside tmux, move this client; switch-client only fails when no client is
+  # attached at all (scripted runs), so fall through to a plain attach.
+  if [[ -n "${TMUX:-}" ]] && tmux switch-client -t "=$s" 2>/dev/null; then
+    return 0
+  fi
+  tmux attach-session -t "=$s"
+}
+
+current_session() {
+  [[ -n "${TMUX:-}" ]] || return 1
+  tmux display-message -p '#{session_name}' 2>/dev/null
+}
+
+# --- pane construction ----------------------------------------------------
+runnable() { command -v "${1%% *}" >/dev/null 2>&1; }
+
+# start_pane <pane_id> <title> [command]
+#   no command -> plain shell; command present -> typed, and run if the binary exists.
+start_pane() {
+  local pane="$1" title="$2" cmd="${3:-}"
+  tmux select-pane -t "$pane" -T "$title"
+  [[ -z "$cmd" ]] && return 0
+  if runnable "$cmd"; then
+    tmux send-keys -t "$pane" "$cmd" C-m
+  else
+    tmux send-keys -t "$pane" "$cmd"   # deliberately no Enter -- binary not on PATH
+    MISSING+=("${cmd%% *}")
+  fi
+}
+
+# build_page <window_target> <title1> <cmd1> ... <title4> <cmd4>
+build_page() {
+  local win="$1"; shift
+  local i
+  for i in 1 2 3; do
+    tmux split-window -t "$win" -c "$DIR"
+    tmux select-layout -t "$win" tiled >/dev/null
+  done
+  tmux select-layout -t "$win" tiled >/dev/null
+
+  local -a panes=()
+  while read -r p; do panes+=("$p"); done < <(tmux list-panes -t "$win" -F '#{pane_id}')
+
+  for i in 0 1 2 3; do
+    start_pane "${panes[$i]}" "$1" "$2"; shift 2
+  done
+  tmux select-pane -t "${panes[0]}"
+}
+
+build_grid() {
+  tmux new-session -d -s "$SESSION" -n agents -c "$DIR" \
+    -x "$(tput cols 2>/dev/null || echo 200)" -y "$(tput lines 2>/dev/null || echo 50)"
+
+  # Mark it as ours so the TUI and r-greezmode can find it again. The trailing
+  # colon is what makes this a session target -- set-option -t rejects "=".
+  # Never fatal: an unmarked grid is still a working grid.
+  tmux set-option -t "$SESSION:" @greezmode 1 >/dev/null 2>&1 || true
+  tmux set-option -t "$SESSION:" @greez_dir "$DIR" >/dev/null 2>&1 || true
+
+  build_page "$SESSION:agents" \
+    "claude"     "$CLAUDE_CMD" \
+    "opencode 1" "$OPENCODE_CMD" \
+    "opencode 2" "$OPENCODE_CMD" \
+    "shell"      ""
+
+  tmux new-window -t "$SESSION" -n scratch -c "$DIR"
+  build_page "$SESSION:scratch" \
+    "scratch 1" "" "scratch 2" "" "scratch 3" "" "scratch 4" ""
+
+  tmux select-window -t "$SESSION:agents"
+
+  echo "greezmode: '$SESSION' ready -- 2 pages x 4 panes in $DIR$( ((RESUME)) && echo ' (agents resuming)')."
+  if ((${#MISSING[@]})); then
+    printf 'greezmode: %s not on PATH -- typed but not run.\n' \
+      "$(printf '%s\n' "${MISSING[@]}" | sort -u | paste -sd, -)"
+  fi
+}
+
+# new_grid <dir> [name] -- build and attach, the way the TUI's "n" does.
+new_grid() {
+  DIR="$1"
+  SESSION="$(free_name "${2:-$(name_for_dir "$DIR")}")"
+  MISSING=()
+  build_grid
+  attach "$SESSION"
+}
+
+# --- shared display helpers -----------------------------------------------
+tildify() {
+  local p="$1"
+  [[ "$p" == "$HOME" || "$p" == "$HOME"/* ]] && p="~${p#"$HOME"}"
+  printf '%s' "$p"
+}
+
+# fitv <var> <string> <width> -- pad or truncate to exactly <width> columns.
+# Pads by character count, not bytes: the tree glyphs and bars are multibyte,
+# and printf's own %-*s would leave those rows short.
+fitv() {
+  local -n _o="$1"; local s="$2" n="$3" len
+  (( n < 1 )) && { _o=""; return 0; }
+  len=${#s}
+  if (( len > n )); then
+    (( n > 2 )) && s="${s:0:n-2}.." || s="${s:0:n}"
+    _o="$s"
+  elif (( len < n )); then
+    printf -v _o '%s%*s' "$s" $(( n - len )) ''
+  else
+    _o="$s"
+  fi
+  return 0
+}
+
+fit() { local _s; fitv _s "$1" "$2"; printf '%s' "$_s"; }
+
+ago() {
+  local now d
+  now="$(date +%s)"; d=$(( now - ${1:-$now} ))
+  (( d < 0 )) && d=0
+  if   (( d < 60 ));    then printf '%ds' "$d"
+  elif (( d < 3600 ));  then printf '%dm' $(( d / 60 ))
+  elif (( d < 86400 )); then printf '%dh' $(( d / 3600 ))
+  else                       printf '%dd' $(( d / 86400 )); fi
+}
+
+# --- monitor engine -------------------------------------------------------
+# One /proc sweep per refresh feeds every row: each pane owns a process tree,
+# and a window/grid is just the sum of the trees underneath it.
+CLK_TCK="$(getconf CLK_TCK 2>/dev/null || echo 100)"
+PAGE_KB=$(( $(getconf PAGESIZE 2>/dev/null || echo 4096) / 1024 ))
+NCPU="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+HAVE_PROC=0; [[ -r /proc/stat ]] && HAVE_PROC=1
+
+declare -A PS_PPID=() PS_KIDS=() PS_RSS=() PS_TICKS=() PS_CPU=() PS_COMM=()
+declare -A HIST=()
+SNAP_TS=0 SNAP_DT=0
+SYS_CPU=0 SYS_MEM_PCT=0 SYS_MEM_USED=0 SYS_MEM_TOTAL=0 SYS_LOAD=""
+PREV_CPU_TOTAL=0 PREV_CPU_IDLE=0
+declare -a SYS_HIST=()
+
+now_us() {
+  local t="${EPOCHREALTIME:-}"
+  if [[ -n "$t" ]]; then
+    t="${t/,/.}"
+    printf '%s' "${t%.*}${t#*.}"
+  else
+    printf '%s000000' "$(date +%s)"
+  fi
+}
+
+# snapshot_procs -- refresh PS_* from /proc; CPU is measured against the
+# previous sweep, so it is what each tree is doing *now*, not a lifetime mean.
+snapshot_procs() {
+  (( HAVE_PROC )) || return 0
+  local d pid line rest comm ticks prev now
+  local -a dirs=( /proc/[0-9]* ) f=()
+  now="$(now_us)"
+  SNAP_DT=$(( now - SNAP_TS ))
+  (( SNAP_TS == 0 )) && SNAP_DT=0
+  SNAP_TS="$now"
+  PS_PPID=(); PS_KIDS=(); PS_RSS=(); PS_CPU=(); PS_COMM=()
+  (( ${#PS_TICKS[@]} > 6000 )) && PS_TICKS=()
+  set -f
+  for d in "${dirs[@]}"; do
+    pid="${d#/proc/}"
+    read -r line 2>/dev/null < "$d/stat" || continue
+    comm="${line%%) *}"; comm="${comm#*(}"
+    rest="${line##*) }"
+    f=( $rest )
+    (( ${#f[@]} > 21 )) || continue
+    # f: 0 state, 1 ppid, 11 utime, 12 stime, 21 rss(pages)
+    ticks=$(( f[11] + f[12] ))
+    prev="${PS_TICKS[$pid]:-}"
+    PS_COMM[$pid]="$comm"
+    PS_PPID[$pid]="${f[1]}"
+    PS_KIDS[${f[1]}]="${PS_KIDS[${f[1]}]:-}$pid "
+    PS_RSS[$pid]=$(( f[21] * PAGE_KB ))
+    if [[ -n "$prev" ]] && (( SNAP_DT > 0 && ticks >= prev )); then
+      # tenths of a percent of one core
+      PS_CPU[$pid]=$(( (ticks - prev) * 1000000000 / (CLK_TCK * SNAP_DT) ))
+    else
+      PS_CPU[$pid]=0
+    fi
+    PS_TICKS[$pid]=$ticks
+  done
+  set +f
+  return 0
+}
+
+# sys_snapshot -- whole-machine cpu/mem/load for the header gauges
+sys_snapshot() {
+  (( HAVE_PROC )) || return 0
+  local -a c=()
+  local total idle dt di key val unit avail=0 a1 a5 a15
+  read -r -a c 2>/dev/null < /proc/stat || true
+  if (( ${#c[@]} > 8 )); then
+    total=$(( c[1]+c[2]+c[3]+c[4]+c[5]+c[6]+c[7]+c[8] ))
+    idle=$(( c[4] + c[5] ))
+    dt=$(( total - PREV_CPU_TOTAL )); di=$(( idle - PREV_CPU_IDLE ))
+    if (( PREV_CPU_TOTAL > 0 && dt > 0 )); then
+      SYS_CPU=$(( (dt - di) * 100 / dt ))
+    fi
+    PREV_CPU_TOTAL=$total; PREV_CPU_IDLE=$idle
+  fi
+  while read -r key val unit; do
+    case "$key" in
+      MemTotal:)     SYS_MEM_TOTAL=$val ;;
+      MemAvailable:) avail=$val; break ;;
+    esac
+  done < /proc/meminfo
+  if (( SYS_MEM_TOTAL > 0 )); then
+    SYS_MEM_USED=$(( SYS_MEM_TOTAL - avail ))
+    SYS_MEM_PCT=$(( SYS_MEM_USED * 100 / SYS_MEM_TOTAL ))
+  fi
+  read -r a1 a5 a15 _ 2>/dev/null < /proc/loadavg || true
+  SYS_LOAD="$a1 $a5 $a15"
+  SYS_HIST+=("$(( SYS_CPU * 10 ))")
+  (( ${#SYS_HIST[@]} > 16 )) && SYS_HIST=( "${SYS_HIST[@]: -16}" )
+  return 0
+}
+
+# tree_stats <pid> -- SUB_CPU (tenths %), SUB_RSS (kB), SUB_N (processes)
+SUB_CPU=0 SUB_RSS=0 SUB_N=0
+walk_tree() {
+  local pid="$1" kid
+  SUB_CPU=$(( SUB_CPU + ${PS_CPU[$pid]:-0} ))
+  SUB_RSS=$(( SUB_RSS + ${PS_RSS[$pid]:-0} ))
+  SUB_N=$(( SUB_N + 1 ))
+  for kid in ${PS_KIDS[$pid]:-}; do walk_tree "$kid"; done
+  return 0
+}
+tree_stats() {
+  SUB_CPU=0; SUB_RSS=0; SUB_N=0
+  [[ -n "${1:-}" && -n "${PS_RSS[${1:-x}]:-}" ]] || return 0
+  walk_tree "$1"
+  return 0
+}
+
+# --- gauges ---------------------------------------------------------------
+C_OFF=$'\033[0m'; C_B=$'\033[1m'; C_DIM=$'\033[2m'; C_REV=$'\033[7m'
+C_FG=$'\033[39m'
+c_grey=$'\033[38;5;244m'; c_dark=$'\033[38;5;238m'
+c_cyan=$'\033[38;5;44m';  c_blue=$'\033[38;5;75m'
+c_green=$'\033[38;5;77m'; c_yellow=$'\033[38;5;179m'; c_red=$'\033[38;5;203m'
+c_mag=$'\033[38;5;140m';  c_white=$'\033[38;5;252m'
+
+heat() { # heat <var> <percent>
+  local -n _o="$1"; local p="$2"
+  if   (( p >= 80 )); then _o="$c_red"
+  elif (( p >= 45 )); then _o="$c_yellow"
+  elif (( p >= 10 )); then _o="$c_green"
+  else                     _o="$c_dark"; fi
+  return 0
+}
+
+# Eighth-blocks, so a pane sipping 4% of a core still draws something.
+BAR8=('' '▏' '▎' '▍' '▌' '▋' '▊' '▉')
+bar() { # bar <var> <tenths-of-a-percent> <width>
+  local -n _o="$1"; local t="$2" w="$3" i sub full part s=""
+  (( t < 0 )) && t=0; (( t > 1000 )) && t=1000
+  sub=$(( t * w * 8 / 1000 ))
+  full=$(( sub / 8 )); part=$(( sub % 8 ))
+  for (( i = 0; i < full; i++ )); do s+='█'; done
+  if (( full < w )); then
+    s+="${BAR8[$part]:-}"
+    (( part > 0 )) && full=$(( full + 1 ))
+  fi
+  for (( i = full; i < w; i++ )); do s+='·'; done
+  _o="$s"
+  return 0
+}
+
+SPARK=('▁' '▂' '▃' '▄' '▅' '▆' '▇' '█')
+spark() { # spark <var> <space-separated tenths> <width>
+  local -n _o="$1"; local data="$2" w="$3"
+  local -a v=( $data ); local max=100 i n lvl s=""
+  n=${#v[@]}
+  (( n > w )) && v=( "${v[@]: -w}" ) && n=$w
+  for i in "${v[@]}"; do (( i > max )) && max=$i; done
+  for (( i = 0; i < w - n; i++ )); do s+=' '; done
+  for i in "${v[@]}"; do
+    lvl=$(( i * 7 / max ))
+    (( lvl > 7 )) && lvl=7
+    s+="${SPARK[$lvl]}"
+  done
+  _o="$s"
+  return 0
+}
+
+hmem() { # hmem <var> <kB>
+  local -n _o="$1"; local kb="$2"
+  if   (( kb <= 0 ));           then _o="-"
+  elif (( kb < 1000 ));         then printf -v _o '%dK' "$kb"
+  elif (( kb < 10240 ));        then printf -v _o '%d.%dM' $(( kb / 1024 )) $(( (kb % 1024) * 10 / 1024 ))
+  elif (( kb < 1048576 ));      then printf -v _o '%dM' $(( kb / 1024 ))
+  else printf -v _o '%d.%dG' $(( kb / 1048576 )) $(( (kb % 1048576) * 10 / 1048576 )); fi
+  return 0
+}
+
+pct10() { # pct10 <var> <tenths>   -> "12.5%" / "   -"
+  local -n _o="$1"; local t="$2"
+  if (( t <= 0 )); then _o="-"
+  elif (( t < 1000 )); then printf -v _o '%d.%d%%' $(( t / 10 )) $(( t % 10 ))
+  else printf -v _o '%d%%' $(( t / 10 )); fi
+  return 0
+}
+
+# --- row model ------------------------------------------------------------
+# Parallel arrays. A grid row owns the session; window rows sit under it, and
+# pane rows -- one per running instance -- sit under those.
+ROW_KIND=(); ROW_SESSION=(); ROW_WINDOW=(); ROW_NAME=(); ROW_INFO=()
+ROW_CPU=(); ROW_MEM=(); ROW_KEY=()
+
+add_row() { # add_row kind session window name info cpu mem histkey
+  ROW_KIND+=("$1"); ROW_SESSION+=("$2"); ROW_WINDOW+=("$3")
+  ROW_NAME+=("$4"); ROW_INFO+=("$5"); ROW_CPU+=("$6"); ROW_MEM+=("$7")
+  ROW_KEY+=("$8")
+  return 0
+}
+
+hist_push() { # hist_push <key> <tenths>
+  local k="$1" v="$2"
+  local -a h=( ${HIST[$k]:-} )
+  h+=("$v")
+  (( ${#h[@]} > 14 )) && h=( "${h[@]: -14}" )
+  HIST[$k]="${h[*]}"
+  return 0
+}
+
+collect_rows() {
+  ROW_KIND=(); ROW_SESSION=(); ROW_WINDOW=(); ROW_NAME=(); ROW_INFO=()
+  ROW_CPU=(); ROW_MEM=(); ROW_KEY=()
+  snapshot_procs
+  sys_snapshot
+
+  local -A W_LIST=() P_LIST=()
+  local sname widx wname wpanes pidx pid ptitle pcmd
+
+  while IFS="$SEP" read -r sname widx wname wpanes; do
+    [[ -z "$sname" ]] && continue
+    W_LIST[$sname]="${W_LIST[$sname]:-}${widx}${SEP}${wname}${SEP}${wpanes}"$'\n'
+  done < <(tmux list-windows -a -F "#{session_name}${SEP}#{window_index}${SEP}#{window_name}${SEP}#{window_panes}" 2>/dev/null || true)
+
+  # free-text pane title goes last, so nothing downstream can be shifted by it
+  while IFS="$SEP" read -r sname widx pidx pid pcmd ptitle; do
+    [[ -z "$sname" ]] && continue
+    P_LIST["$sname$SEP$widx"]="${P_LIST["$sname$SEP$widx"]:-}${pidx}${SEP}${pid}${SEP}${pcmd}${SEP}${ptitle}"$'\n'
+  done < <(tmux list-panes -a -F "#{session_name}${SEP}#{window_index}${SEP}#{pane_index}${SEP}#{pane_pid}${SEP}#{pane_current_command}${SEP}#{pane_title}" 2>/dev/null || true)
+
+  local la cr name mark dir att cur state
+  local scpu smem wcpu wmem pcpu pmem procs summary key
+  cur="$(current_session || true)"
+
+  local -a SROW=() ; local sidx
+  while IFS="$SEP" read -r la cr name mark att dir; do
+    [[ -z "$name" ]] && continue
+    [[ -z "$dir" ]] && dir="$(tmux display-message -p -t "=$name:" '#{pane_current_path}' 2>/dev/null || echo '?')"
+    if   [[ "$name" == "$cur" ]]; then state="you are here"
+    elif [[ "$att" == "1" ]];      then state="attached"
+    else                                state="detached"
+    fi
+
+    sidx=${#ROW_KIND[@]}
+    add_row session "$name" "" "$name" "$(tildify "$dir")  ·  $state  ·  up $(ago "$cr")" 0 0 "s:$name"
+    scpu=0; smem=0
+
+    while IFS="$SEP" read -r widx wname wpanes; do
+      [[ -z "$widx" ]] && continue
+      wcpu=0; wmem=0; summary=""
+      local -A cmdcount=()
+      local -a prows=()
+      while IFS="$SEP" read -r pidx pid pcmd ptitle; do
+        [[ -z "$pidx" ]] && continue
+        tree_stats "$pid"
+        pcpu=$SUB_CPU; pmem=$SUB_RSS; procs=$SUB_N
+        wcpu=$(( wcpu + pcpu )); wmem=$(( wmem + pmem ))
+        cmdcount[${pcmd:-?}]=$(( ${cmdcount[${pcmd:-?}]:-0} + 1 ))
+        prows+=("${pidx}${SEP}${pid}${SEP}${pcpu}${SEP}${pmem}${SEP}${procs}${SEP}${pcmd}${SEP}${ptitle}")
+      done < <(printf '%s' "${P_LIST["$name$SEP$widx"]:-}")
+
+      for key in "${!cmdcount[@]}"; do
+        (( cmdcount[$key] > 1 )) && summary+="$key x${cmdcount[$key]}, " || summary+="$key, "
+      done
+      summary="${summary%, }"
+
+      key="w:$name:$widx"
+      hist_push "$key" "$wcpu"
+      add_row window "$name" "$widx" "├ $widx $wname" "$summary" "$wcpu" "$wmem" "$key"
+
+      if (( PANES )); then
+        local pr
+        for pr in "${prows[@]}"; do
+          IFS="$SEP" read -r pidx pid pcpu pmem procs pcmd ptitle <<< "$pr"
+          key="p:$name:$widx:$pidx"
+          hist_push "$key" "$pcpu"
+          add_row pane "$name" "$widx" "│  ▪ ${ptitle:-pane $pidx}" \
+            "$pcmd · pid $pid · $procs proc$( (( procs == 1 )) || echo s )" \
+            "$pcpu" "$pmem" "$key"
+        done
+      fi
+
+      scpu=$(( scpu + wcpu )); smem=$(( smem + wmem ))
+      unset cmdcount
+    done < <(printf '%s' "${W_LIST[$name]:-}")
+
+    ROW_CPU[$sidx]=$scpu; ROW_MEM[$sidx]=$smem
+    hist_push "s:$name" "$scpu"
+  done < <(greez_sessions)
+
+  (( SORT_CPU )) && sort_rows_by_cpu
+  return 0
+}
+
+# sort_rows_by_cpu -- reorder whole grid blocks (grid + its children) by load,
+# so the busiest agents float to the top without breaking the tree.
+sort_rows_by_cpu() {
+  local i n=${#ROW_KIND[@]} start
+  local -a starts=() order=()
+  for (( i = 0; i < n; i++ )); do
+    [[ "${ROW_KIND[$i]}" == "session" ]] && starts+=("$i")
+  done
+  (( ${#starts[@]} < 2 )) && return 0
+  local -a keyed=()
+  for i in "${!starts[@]}"; do
+    start=${starts[$i]}
+    keyed+=("$(printf '%012d %d' "${ROW_CPU[$start]}" "$i")")
+  done
+  local -a K=(); local line
+  while read -r line; do K+=("$line"); done < <(printf '%s\n' "${keyed[@]}" | sort -rn)
+
+  local -a k_kind=() k_sess=() k_win=() k_name=() k_info=() k_cpu=() k_mem=() k_key=()
+  local bi begin end j
+  for line in "${K[@]}"; do
+    bi="${line##* }"
+    begin=${starts[$bi]}
+    if (( bi + 1 < ${#starts[@]} )); then end=$(( starts[bi+1] - 1 )); else end=$(( n - 1 )); fi
+    for (( j = begin; j <= end; j++ )); do
+      k_kind+=("${ROW_KIND[$j]}"); k_sess+=("${ROW_SESSION[$j]}"); k_win+=("${ROW_WINDOW[$j]}")
+      k_name+=("${ROW_NAME[$j]}"); k_info+=("${ROW_INFO[$j]}"); k_cpu+=("${ROW_CPU[$j]}")
+      k_mem+=("${ROW_MEM[$j]}");  k_key+=("${ROW_KEY[$j]}")
+    done
+  done
+  ROW_KIND=("${k_kind[@]}"); ROW_SESSION=("${k_sess[@]}"); ROW_WINDOW=("${k_win[@]}")
+  ROW_NAME=("${k_name[@]}"); ROW_INFO=("${k_info[@]}"); ROW_CPU=("${k_cpu[@]}")
+  ROW_MEM=("${k_mem[@]}");  ROW_KEY=("${k_key[@]}")
+  return 0
+}
+
+list_plain() {
+  local saved=$SORT_CPU
+  collect_rows
+  if (( HAVE_PROC )); then           # second sweep so cpu is a real interval
+    sleep 0.2; SORT_CPU=$saved; collect_rows
+  fi
+  if (( ${#ROW_KIND[@]} == 0 )); then
+    echo "greezmode: no live grids."
+    return 0
+  fi
+  local i cpu mem name info
+  printf '%s %s %8s %8s\n' "$(fit 'GRID / WINDOW / PANE' 34)" "$(fit DETAIL 42)" CPU MEM
+  for i in "${!ROW_KIND[@]}"; do
+    pct10 cpu "${ROW_CPU[$i]}"; hmem mem "${ROW_MEM[$i]}"
+    fitv name "$( [[ "${ROW_KIND[$i]}" == session ]] && printf '▸ ' || printf '  ' )${ROW_NAME[$i]}" 34
+    fitv info "${ROW_INFO[$i]}" 42
+    printf '%s %s %8s %8s\n' "$name" "$info" "$cpu" "$mem"
+  done
+  return 0
+}
+
+# --- TUI ------------------------------------------------------------------
+TUI_UP=0
+SEL=0
+STATUS=""
+
+tui_setup() {
+  (( TUI_UP )) && return 0
+  TUI_UP=1
+  tput smcup 2>/dev/null || true
+  tput civis 2>/dev/null || true
+  stty -echo 2>/dev/null || true
+  trap tui_teardown EXIT INT TERM
+  return 0
+}
+
+tui_teardown() {
+  (( TUI_UP )) || return 0
+  TUI_UP=0
+  stty echo 2>/dev/null || true
+  tput cnorm 2>/dev/null || true
+  tput rmcup 2>/dev/null || true
+  return 0
+}
+
+# read_key -- one keypress, normalised to a word; "tick" when the sample is due
+read_key() {
+  local k rest
+  IFS= read -rsn1 -t "$REFRESH" k 2>/dev/null || { printf 'tick'; return 0; }
+  if [[ "$k" == $'\e' ]]; then
+    IFS= read -rsn2 -t 0.05 rest 2>/dev/null || rest=""
+    case "$rest" in
+      '[A') printf 'up' ;;
+      '[B') printf 'down' ;;
+      '[C'|'[D') printf 'none' ;;
+      '')   printf 'quit' ;;
+      *)    printf 'none' ;;
+    esac
+    return 0
+  fi
+  case "$k" in
+    '')          printf 'enter' ;;
+    k|K)         printf 'up' ;;
+    j|J)         printf 'down' ;;
+    x|X|d|D)     printf 'close' ;;
+    n|N)         printf 'new' ;;
+    r|R)         printf 'refresh' ;;
+    a|A)         printf 'all' ;;
+    p|P)         printf 'panes' ;;
+    m|M)         printf 'monitor' ;;
+    s|S)         printf 'sort' ;;
+    +|=)         printf 'faster' ;;
+    -|_)         printf 'slower' ;;
+    q|Q|$'\003') printf 'quit' ;;
+    *)           printf 'none' ;;
+  esac
+}
+
+# put <line> -- one screen line, clearing whatever the last frame left there
+put() { printf '%s\033[K\n' "$1"; }
+
+# hdr_line <inner> <plain> <coloured> ...  -- fill a header row with as many
+# segments as the width allows, dropping the tail ones on a narrow terminal.
+_HDR=""
+hdr_line() {
+  local inner="$1"; shift
+  local out="" used=0 pl co
+  while (( $# >= 2 )); do
+    pl="$1"; co="$2"; shift 2
+    (( used + ${#pl} > inner )) && break
+    out+="$co"; used=$(( used + ${#pl} ))
+  done
+  printf -v _HDR '%s%s%*s' "$out" "$C_OFF" $(( inner - used )) ''
+  return 0
+}
+
+draw_header() {
+  local cols="$1" grids="$2" inner rule cbar mbar sp used tot hc hm
+  inner=$(( cols - 2 ))
+  (( inner < 20 )) && inner=20
+  printf -v rule '%*s' "$inner" ''; rule="${rule// /─}"
+
+  put "${c_cyan}╭${rule}╮${C_OFF}"
+
+  local gs="grid$( (( grids == 1 )) || echo s )"
+  hdr_line "$inner" \
+    "  greezmode" "  ${C_B}${c_white}greez${c_mag}mode${C_OFF}" \
+    "  ▏  ${grids} live ${gs}" "${c_grey}  ▏  ${c_white}${grids}${c_grey} live ${gs}" \
+    "$( (( SORT_CPU )) && echo '  ▏ by cpu' )" "$( (( SORT_CPU )) && echo "${c_grey}  ▏ ${c_yellow}by cpu" )" \
+    "$( (( SHOW_ALL )) && echo '  ▏ all sessions' )" "$( (( SHOW_ALL )) && echo "${c_grey}  ▏ ${c_yellow}all sessions" )"
+  put "${c_cyan}│${C_OFF}${_HDR}${c_cyan}│${C_OFF}"
+
+  if (( HAVE_PROC && MON )); then
+    local bw=$(( inner / 4 )); (( bw > 26 )) && bw=26; (( bw < 8 )) && bw=8
+    heat hc "$SYS_CPU"; heat hm "$SYS_MEM_PCT"
+    bar cbar $(( SYS_CPU * 10 )) "$bw"; bar mbar $(( SYS_MEM_PCT * 10 )) "$bw"
+    spark sp "${SYS_HIST[*]:-0}" 14
+    hmem used "$SYS_MEM_USED"; hmem tot "$SYS_MEM_TOTAL"
+    local cp mp cores
+    printf -v cp '%3d%%' "$SYS_CPU"; printf -v mp '%3d%%' "$SYS_MEM_PCT"
+    cores="${NCPU} core$( (( NCPU == 1 )) || echo s )"
+
+    hdr_line "$inner" \
+      "  cpu  " "${c_grey}  cpu  " \
+      "$cbar"   "${hc}${cbar}" \
+      " $cp"    "${c_white} ${cp}" \
+      "  $cores" "${c_grey}  ${cores}" \
+      "   $sp"  "${c_blue}   ${sp}" \
+      "   load $SYS_LOAD" "${c_grey}   load ${SYS_LOAD}"
+    put "${c_cyan}│${C_OFF}${_HDR}${c_cyan}│${C_OFF}"
+
+    hdr_line "$inner" \
+      "  mem  " "${c_grey}  mem  " \
+      "$mbar"   "${hm}${mbar}" \
+      " $mp"    "${c_white} ${mp}" \
+      "  $used / $tot" "${c_grey}  ${c_white}${used}${c_grey} / ${tot}" \
+      "   every ${REFRESH}s" "${c_dark}   every ${REFRESH}s"
+    put "${c_cyan}│${C_OFF}${_HDR}${c_cyan}│${C_OFF}"
+  fi
+  put "${c_cyan}╰${rule}╯${C_OFF}"
+  return 0
+}
+
+# render_row <index> <cols> -- coloured line in REND, its printed width in REND_W
+REND=""
+REND_W=0
+render_row() {
+  local i="$1" cols="$2"
+  local kind="${ROW_KIND[$i]}" cpu="${ROW_CPU[$i]}" mem="${ROW_MEM[$i]}"
+  local nw dw bw=10 sw=10 right=0 gap=0
+  local name info cbar cpct memh sp hc pct
+
+  if (( MON && HAVE_PROC )); then
+    if   (( cols >= 110 )); then right=$(( bw + 8 + 8 + sw + 5 ))
+    elif (( cols >= 92 ));  then sw=0; right=$(( bw + 8 + 8 + 4 ))
+    else bw=0; sw=0; right=$(( 8 + 8 + 3 )); fi
+  fi
+
+  nw=32; (( cols < 92 )) && nw=28; (( cols < 72 )) && nw=24
+  dw=$(( cols - nw - right - 4 ))
+  (( dw > 54 )) && { gap=$(( dw - 54 )); dw=54; }
+  (( dw < 6 )) && dw=6
+
+  local mark="  "
+  [[ "$kind" == "session" ]] && mark="▸ "
+  fitv name "${ROW_NAME[$i]}" $(( nw - 2 ))
+  fitv info "${ROW_INFO[$i]}" "$dw"
+  (( gap > 0 )) && printf -v info '%s%*s' "$info" "$gap" ''
+
+  local cname cinfo
+  case "$kind" in
+    session) cname="${C_B}${c_white}"; cinfo="${c_grey}" ;;
+    window)  cname="${c_blue}";        cinfo="${c_dark}" ;;
+    *)       cname="${c_mag}";         cinfo="${c_dark}" ;;
+  esac
+
+  # No full resets inside the line: they would cancel the selection highlight.
+  REND=" ${c_cyan}${mark}${cname}${name}${C_FG} ${cinfo}${info}${C_FG}"
+  REND_W=$(( 1 + 2 + nw - 2 + 1 + dw + gap ))
+
+  if (( MON && HAVE_PROC )); then
+    pct=$(( cpu / 10 ))
+    heat hc "$pct"
+    pct10 cpct "$cpu"; hmem memh "$mem"
+    REND+=" "; REND_W=$(( REND_W + 1 ))
+    if (( bw > 0 )); then
+      bar cbar "$cpu" "$bw"
+      REND+="${hc}${cbar}${C_FG} "; REND_W=$(( REND_W + bw + 1 ))
+    fi
+    printf -v cpct '%6s' "$cpct"; printf -v memh '%7s' "$memh"
+    REND+="${hc}${cpct}${C_FG} ${c_cyan}${memh}${C_FG}"
+    REND_W=$(( REND_W + 6 + 1 + 7 ))
+    if (( sw > 0 )); then
+      spark sp "${HIST[${ROW_KEY[$i]}]:-0}" "$sw"
+      REND+=" ${c_blue}${sp}${C_FG}"
+      REND_W=$(( REND_W + 1 + sw ))
+    fi
+  fi
+  return 0
+}
+
+draw() {
+  local i grids=0 cols lines
+  cols="$(tput cols 2>/dev/null || echo 80)"
+  lines="$(tput lines 2>/dev/null || echo 24)"
+  (( cols > 200 )) && cols=200
+  for i in "${!ROW_KIND[@]}"; do
+    [[ "${ROW_KIND[$i]}" == "session" ]] && grids=$((grids + 1))
+  done
+
+  printf '\033[H'
+  draw_header "$cols" "$grids"
+
+  if (( ${#ROW_KIND[@]} == 0 )); then
+    put ""
+    put "   no live grids. press ${C_B}n${C_OFF} to build one."
+  else
+    local total=${#ROW_KIND[@]} shown=0 room
+    room=$(( lines - 11 ))
+    (( MON && HAVE_PROC )) || room=$(( room + 2 ))
+    (( room < 3 )) && room=3
+    local first=0
+    (( SEL >= room )) && first=$(( SEL - room + 1 ))
+    for i in "${!ROW_KIND[@]}"; do
+      (( i < first )) && continue
+      (( shown >= room )) && break
+      shown=$(( shown + 1 ))
+      render_row "$i" "$cols"
+      if (( i == SEL )); then
+        local tail=""
+        (( REND_W < cols )) && printf -v tail '%*s' $(( cols - REND_W )) ''
+        put "${C_REV}${REND}${tail}${C_OFF}"
+      else
+        put "${REND}${C_OFF}"
+      fi
+    done
+    local rest=$(( total - first - shown ))
+    (( first > 0 )) && put "${c_dark}   ↑ ${first} more above${C_OFF}"
+    (( rest > 0 ))  && put "${c_dark}   ↓ ${rest} more below${C_OFF}"
+  fi
+
+  put ""
+  local key_hint=""
+  key_hint+="${c_grey}↑↓${c_dark} move  ${c_grey}⏎${c_dark} resume  ${c_grey}x${c_dark} close  ${c_grey}n${c_dark} new  "
+  if (( cols >= 92 )); then
+    key_hint+="${c_grey}p${c_dark} panes  ${c_grey}m${c_dark} monitor  ${c_grey}s${c_dark} sort  ${c_grey}+/-${c_dark} rate  ${c_grey}a${c_dark} all  "
+  fi
+  key_hint+="${c_grey}q${c_dark} quit${C_OFF}"
+  put " $key_hint"
+  if [[ -n "$STATUS" ]]; then put ""; put " $STATUS"; fi
+  printf '\033[J'
+  return 0
+}
+
+# prompt_line <text> -- read a line with the cursor visible, echo it back
+prompt_line() {
+  local ans
+  # Runs inside a command substitution, so every byte of terminal control has
+  # to go to stderr -- anything on stdout ends up inside the answer.
+  tput cnorm >&2 2>/dev/null || true
+  stty echo >&2 2>/dev/null || true
+  printf '\n %s' "$1" >&2
+  IFS= read -r ans || ans=""
+  stty -echo >&2 2>/dev/null || true
+  tput civis >&2 2>/dev/null || true
+  printf '%s' "$ans"
+}
+
+confirm() {
+  local k
+  printf '\n %s [y/N] ' "$1"
+  IFS= read -rsn1 k 2>/dev/null || k=""
+  [[ "$k" == y || "$k" == Y ]]
+}
+
+do_resume() {
+  local s="$1" w="$2"
+  tui_teardown
+  echo "greezmode: reattaching to '$s'${w:+ (window $w)} -- work kept running."
+  attach "$s" "$w"
+  exit 0
+}
+
+do_close() {
+  local kind="$1" s="$2" w="$3" cur
+  cur="$(current_session || true)"
+  if [[ "$kind" == "session" ]]; then
+    if [[ "$s" == "$cur" ]]; then
+      STATUS="${c_yellow}refusing to close the grid you are attached to.${C_OFF}"
+      return 0
+    fi
+    confirm "close grid '$s' and everything running in it?" || { STATUS="left '$s' alone."; return 0; }
+    tmux kill-session -t "=$s" 2>/dev/null && STATUS="closed grid '$s'." || STATUS="could not close '$s'."
+  else
+    if [[ "$s" == "$cur" ]] && [[ "$w" == "$(tmux display-message -p '#{window_index}' 2>/dev/null)" ]]; then
+      STATUS="${c_yellow}refusing to close the window you are sitting in.${C_OFF}"
+      return 0
+    fi
+    confirm "close window $w of '$s'?" || { STATUS="left $s:$w alone."; return 0; }
+    tmux kill-window -t "=$s:$w" 2>/dev/null && STATUS="closed $s:$w." || STATUS="could not close $s:$w."
+  fi
+  return 0
+}
+
+do_new() {
+  local d n
+  d="$(prompt_line "new grid in directory [$(tildify "$PWD")]: ")"
+  [[ -z "$d" ]] && d="$PWD"
+  d="${d/#\~/$HOME}"
+  if ! d="$(cd "$d" 2>/dev/null && pwd)"; then
+    STATUS="${c_red}no such directory.${C_OFF}"
+    return 0
+  fi
+  n="$(prompt_line "session name [$(free_name "$(name_for_dir "$d")")]: ")"
+  tui_teardown
+  new_grid "$d" "${n:-}"
+  exit 0
+}
+
+tui() {
+  local monitor_only="${1:-0}"
+  collect_rows
+  # cpu is a delta between sweeps, so take a second one before the first frame
+  (( HAVE_PROC )) && { sleep 0.25; collect_rows; }
+  tui_setup
+  printf '\033[2J'
+  local key
+  while :; do
+    (( ${#ROW_KIND[@]} > 0 && SEL >= ${#ROW_KIND[@]} )) && SEL=$(( ${#ROW_KIND[@]} - 1 ))
+    (( SEL < 0 )) && SEL=0
+    draw
+    key="$(read_key)"
+    case "$key" in
+      tick)    collect_rows ;;
+      up)      (( SEL > 0 )) && SEL=$(( SEL - 1 )); STATUS="" ;;
+      down)    (( SEL < ${#ROW_KIND[@]} - 1 )) && SEL=$(( SEL + 1 )); STATUS="" ;;
+      enter)
+        (( monitor_only )) && continue
+        (( ${#ROW_KIND[@]} == 0 )) && { STATUS="nothing to resume -- press n."; continue; }
+        do_resume "${ROW_SESSION[$SEL]}" "${ROW_WINDOW[$SEL]}" ;;
+      close)
+        (( monitor_only )) && continue
+        (( ${#ROW_KIND[@]} == 0 )) && { STATUS="nothing to close."; continue; }
+        [[ "${ROW_KIND[$SEL]}" == "pane" ]] && { STATUS="select a grid or window row to close."; continue; }
+        do_close "${ROW_KIND[$SEL]}" "${ROW_SESSION[$SEL]}" "${ROW_WINDOW[$SEL]}"
+        printf '\033[2J'; collect_rows ;;
+      new)     (( monitor_only )) && continue; do_new ;;
+      panes)   PANES=$(( 1 - PANES )); STATUS=""; printf '\033[2J'; collect_rows ;;
+      monitor) MON=$(( 1 - MON )); STATUS=""; printf '\033[2J' ;;
+      sort)    SORT_CPU=$(( 1 - SORT_CPU )); STATUS=""; collect_rows ;;
+      faster)  case "$REFRESH" in 5) REFRESH=2 ;; 2) REFRESH=1 ;; *) REFRESH=0.5 ;; esac; STATUS="" ;;
+      slower)  case "$REFRESH" in 0.5) REFRESH=1 ;; 1) REFRESH=2 ;; *) REFRESH=5 ;; esac; STATUS="" ;;
+      all)     SHOW_ALL=$(( 1 - SHOW_ALL )); STATUS=""; printf '\033[2J'; collect_rows ;;
+      refresh) STATUS=""; printf '\033[2J'; collect_rows ;;
+      quit)    tui_teardown; exit 0 ;;
+    esac
+  done
+}
+
+# --- dispatch -------------------------------------------------------------
+if (( LIST_ONLY )); then
+  list_plain
+  exit 0
+fi
+
+if (( TOP_ONLY )); then
+  [[ -t 0 && -t 1 ]] || { list_plain; exit 0; }
+  tui 1
+fi
+
+# resume: reattach to running work, no TUI
+if (( RESUME )); then
+  target=""
+  if (( SESSION_EXPLICIT )); then
+    tmux has-session -t "=$SESSION" 2>/dev/null && target="$SESSION"
+  elif (( DIR_GIVEN )); then
+    target="$(latest_session "$(name_for_dir "$DIR")" || true)"
+  else
+    target="$(latest_session || true)"   # whatever grid you were last in
+  fi
+
+  if [[ -n "$target" ]]; then
+    echo "greezmode: reattaching to '$target' -- work kept running."
+    attach "$target"
+    exit 0
+  fi
+
+  echo "greezmode: nothing running to resume -- building a fresh grid."
+  CLAUDE_CMD="$CLAUDE_CMD --continue"
+  OPENCODE_CMD="$OPENCODE_CMD --continue"
+  NEW_ONLY=1
+fi
+
+# An explicit target (dir, name, or --new) means build, the way it always did.
+if (( NEW_ONLY || DIR_GIVEN || SESSION_EXPLICIT )); then
+  : "${DIR:=$PWD}"
+  new_grid "$DIR" "$SESSION"
+  exit 0
+fi
+
+# Bare `greezmode`: the TUI, unless there is no terminal or nothing to show.
+if [[ ! -t 0 || ! -t 1 ]]; then
+  list_plain
+  exit 0
+fi
+
+collect_rows
+if (( ${#ROW_KIND[@]} == 0 )); then
+  echo "greezmode: no live grids -- building one in $(tildify "$PWD")."
+  new_grid "$PWD"
+  exit 0
+fi
+
+tui

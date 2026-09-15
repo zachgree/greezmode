@@ -1,0 +1,4 @@
+*.bak
+.greezmode.bak.*
+*.swp
+.DS_Store

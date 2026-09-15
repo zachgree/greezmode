@@ -76,3 +76,7 @@ agents resuming their last conversation) when there is nothing left to attach to
 | `GREEZ_REFRESH` | seconds between live samples (default `2`) |
 | `GREEZ_MON` | monitor columns on/off (`1`/`0`) |
 | `GREEZ_PANES` | per-pane rows on/off (`1`/`0`) |
+
+## License
+
+MIT — see [LICENSE](LICENSE).
